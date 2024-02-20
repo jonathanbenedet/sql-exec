@@ -1,0 +1,117 @@
+#!/usr/bin/env groovy
+pipeline {
+    environment {
+        GIT_USER_EMAIL = "jenkins.empresas@projuris.com.br"
+        GIT_USER_NAME = "Jenkins Pipeline"
+    }
+
+    options {
+        skipDefaultCheckout()
+    }
+
+    agent {
+        kubernetes {
+            defaultContainer 'awslocal'
+            yaml """
+            spec:
+              containers:
+              - name: clientep
+                image: codingpuss/postgres-client
+                command:
+                - cat
+                tty: true
+              - name: awslocal
+                image: local/sql-name:latest
+                imagePullPolicy: Never
+                command:
+                - cat
+                tty: true
+            """
+        }
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                sh """
+                    apk add git
+                    git config --global user.email '${GIT_USER_EMAIL}'
+                    git config --global user.name '${GIT_USER_NAME}'
+                """
+                script {
+                    checkout scm
+                    def commitMessage = sh(returnStdout: true, script: "git log -1 | cat").trim()
+                    echo commitMessage
+
+                    hasApplicationChanges()
+
+                    //git diff-tree --no-commit-id --name-only -r 2560c7f | grep .sql
+                }
+            }
+        }
+        stage('teste') {
+            steps {
+                dir('your-sub-directory') {
+                    container('clientep') {
+                        sh(script: '''
+                        psql postgres://postgres:postgres@postgres:5432/padrao pager=off -c "COPY (select 1) TO STDOUT WITH CSV HEADER;" > output.csv
+                        ls
+                        '''
+                        )
+                    }
+                    container('awslocal') {
+
+                        script {
+                            sh """
+                                ls
+                                aws configure set aws_access_key_id fakeAccessKeyId
+                                aws configure set aws_secret_access_key fakeSecretAccessKey
+
+                                aws --endpoint-url=http://s3local-localstack:4566 s3api put-object --bucket arquivos --key ${currentBuild.startTimeInMillis}.csv --body output.csv
+                                aws --endpoint-url=http://s3local-localstack:4566 s3 presign s3://arquivos/${currentBuild.startTimeInMillis}.csv --expires-in 604800
+                            """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@NonCPS
+ArrayList getChangedFilesList() {
+    changedFiles = []
+    for (changeLogSet in currentBuild.changeSets) {
+        for (entry in changeLogSet.getItems()) { // for each commit in the detected changes
+            for (file in entry.getAffectedFiles()) {
+                changedFiles.add(file.getPath()) // add changed file to list
+            }
+        }
+    }
+    return changedFiles
+}
+
+@NonCPS
+/*
+Verifica se existe arquivos modificados.
+*/
+boolean hasApplicationChanges() {
+    def changeLogSets = currentBuild.changeSets
+    if (changeLogSets.size() == 0) {
+        return true;
+    }
+    for (int i = 0; i < changeLogSets.size(); i++) {
+        def entries = changeLogSets[i].items
+        for (int j = 0; j < entries.length; j++) {
+            def entry = entries[j]
+            echo "${entry.commitId} by ${entry.author} on ${new Date(entry.timestamp)}: ${entry.msg}"
+            def files = new ArrayList(entry.affectedFiles)
+            for (int k = 0; k < files.size(); k++) {
+                def file = files[k]
+                echo "arquivo ${file.path}"
+                return true;
+            }
+        }
+    }
+    return false;
+}
