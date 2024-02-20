@@ -1,0 +1,6 @@
+<query>
+    <namespace>dev</namespace>
+    <sql>
+        select *,1 as teste from m_usuario;
+    </sql>
+</query>

@@ -3,10 +3,19 @@ pipeline {
     environment {
         GIT_USER_EMAIL = "jenkins.empresas@projuris.com.br"
         GIT_USER_NAME = "Jenkins Pipeline"
+
+        //Credencial salva no vault
+        CREDENTIAL_ID_PRODUCTION = "empresas_production@projuris-empresas-production"
+        CREDENTIAL_ID_STAGING = "empresas_staging@projuris-empresas-staging"
+        CREDENTIAL_ID_CONTROL_PRODUCTION = "empresas_production@projuris-empresas-production"
+        CREDENTIAL_ID_CONTROL_STAGING = "empresas_staging@projuris-empresas-staging"
+
+        UPLOAD_BUCKET_NAME = "arquivos"
     }
 
     options {
         skipDefaultCheckout()
+        disableConcurrentBuilds()
     }
 
     agent {
@@ -31,45 +40,131 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout Queries') {
             steps {
                 sh """
                     apk add git
                     git config --global user.email '${GIT_USER_EMAIL}'
                     git config --global user.name '${GIT_USER_NAME}'
+                    git config --global --add safe.directory '*'
                 """
                 script {
                     checkout scm
-                    def commitMessage = sh(returnStdout: true, script: "git log -1 | cat").trim()
-                    echo commitMessage
-
-                    hasApplicationChanges()
-
-                    //git diff-tree --no-commit-id --name-only -r 2560c7f | grep .sql
+                    String hashCommit = sh(returnStdout: true, script: "git log -1 --pretty=format:\"%h\" | cat").trim()
+                    QUERY_LOG_FILES = sh(returnStdout: true, script: "git diff-tree --no-commit-id --name-only -r ${hashCommit} | grep -E 'query/.*\\.xml'").trim()
+                    COMMAND_LOG_FILES = sh(returnStdout: true, script: "git diff-tree --no-commit-id --name-only -r ${hashCommit} | grep -E 'command/.*\\.xml'").trim()
+                    echo "Query Files: ${QUERY_LOG_FILES}"
+                    echo "Command Files: ${COMMAND_LOG_FILES}"
                 }
             }
         }
-        stage('teste') {
+        stage('Execute SELECT Queries') {
             steps {
-                dir('your-sub-directory') {
-                    container('clientep') {
-                        sh(script: '''
-                        psql postgres://postgres:postgres@postgres:5432/padrao pager=off -c "COPY (select 1) TO STDOUT WITH CSV HEADER;" > output.csv
-                        ls
-                        '''
-                        )
+                container('clientep') {
+                    script {
+                        EXPORTED_QUERY_FILES = []
+                        sh "apk add xmlstarlet"
+                        sh "mkdir -p output"
+                        QUERY_FILES = QUERY_LOG_FILES.split('\n')
+
+                        for (int i = 0; i < QUERY_FILES.size(); i++) {
+                            String filePath = QUERY_FILES[i]
+
+                            String namespace = sh(returnStdout: true, script: "xmlstarlet sel -t -m \"//namespace\" -v . -n < ${filePath}").trim()
+                            String rawQuery = sh(returnStdout: true, script: "xmlstarlet sel -t -m \"//sql\" -v . -n < ${filePath}").trim()
+
+                            echo namespace
+
+                            String urlDbQuery = ""
+                            String urlDbControl = ""
+//                            withCredentials([vaultString(credentialsId: "${credential}", variable: 'PASSWORD')]) {
+                            urlDbQuery = createMainDatabaseUrl(namespace, "postgres")
+                            urlDbControl = createControlDatabaseUrl(namespace, "postgres")
+//                            }
+
+                            echo urlDbControl
+
+                            boolean executed = sh(returnStdout: true, script: "psql -qtA ${urlDbControl} -c \"select true from execution_control where execution_file = '${filePath}'\"").trim()
+                            if (executed) {
+                                echo "Script ${filePath} já executado anteriormente. Pulando execução do mesmo."
+                                continue
+                            }
+
+                            GString exportedFileName = "${currentBuild.startTimeInMillis}_${i}.csv"
+                            String formattedQuery = sh(returnStdout: true, script: "echo \"${rawQuery}\" | tr -d '\\n;'").trim()
+
+                            sh "psql ${urlDbQuery} pager=off -c \"COPY (${formattedQuery}) TO STDOUT WITH CSV HEADER;\" > output/${exportedFileName}"
+                            sh "psql ${urlDbControl} -c \"insert into execution_control (execution_file) values ('${filePath}')\";"
+
+                            EXPORTED_QUERY_FILES << exportedFileName
+                        }
                     }
-                    container('awslocal') {
+                }
+            }
+        }
+        stage('Execute Command Queries') {
+            steps {
+                container('clientep') {
+                    script {
+                        sh "mkdir -p output"
+                        COMMAND_FILES = COMMAND_LOG_FILES.split('\n')
+                        for (int i = 0; i < COMMAND_FILES.size(); i++) {
+                            String filePath = COMMAND_FILES[i]
 
-                        script {
+                            String namespace = sh(returnStdout: true, script: "xmlstarlet sel -t -m \"//namespace\" -v . -n < ${filePath}").trim()
+                            String rawQuery = sh(returnStdout: true, script: "xmlstarlet sel -t -m \"//sql\" -v . -n < ${filePath}").trim()
+
+                            String urlDbQuery = ""
+                            String urlDbControl = ""
+//                            withCredentials([vaultString(credentialsId: "${credential}", variable: 'PASSWORD')]) {
+                            urlDbQuery = createMainDatabaseUrl(namespace, "postgres")
+                            urlDbControl = createControlDatabaseUrl(namespace, "postgres")
+//                            }
+
+
+                            boolean executed = sh(returnStdout: true, script: "psql -qtA ${urlDbControl} -c \"select true from execution_control where execution_file = '${filePath}'\"").trim()
+                            if (executed) {
+                                echo "Script ${filePath} já executado anteriormente. Pulando execução do mesmo."
+                                continue
+                            }
+
+                            String formattedQuery = sh(returnStdout: true, script: "echo \"${rawQuery}\" | tr -d '\\n;'").trim()
+
+                            sh "psql ${urlDbQuery} -c \"${formattedQuery}\""
+                            sh "psql ${urlDbControl} -c \"insert into execution_control (execution_file) values ('${filePath}')\";"
+                        }
+                    }
+                }
+            }
+        }
+        stage('Upload de Arquivos no S3') {
+            when {
+                expression {
+
+                    if (EXPORTED_QUERY_FILES.size() == 0) {
+                        echo "Nenhuma consulta feita, logo, essa etapa não foi executada."
+                        return false
+                    }
+                    return true
+                }
+            }
+            steps {
+                container('awslocal') {
+                    script {
+                        sh """
+                            aws configure set aws_access_key_id fakeAccessKeyId
+                            aws configure set aws_secret_access_key fakeSecretAccessKey
+                        """
+                        for (int i = 0; i < EXPORTED_QUERY_FILES.size(); i++) {
                             sh """
-                                ls
-                                aws configure set aws_access_key_id fakeAccessKeyId
-                                aws configure set aws_secret_access_key fakeSecretAccessKey
+                            cd output
+                            ls
+                            echo "Fazendo upload do arquivo gerado para o S3..."
+                            aws --endpoint-url=http://s3local-localstack:4566 s3api put-object --bucket ${UPLOAD_BUCKET_NAME} --key ${EXPORTED_QUERY_FILES[i]} --body ${EXPORTED_QUERY_FILES[i]}
 
-                                aws --endpoint-url=http://s3local-localstack:4566 s3api put-object --bucket arquivos --key ${currentBuild.startTimeInMillis}.csv --body output.csv
-                                aws --endpoint-url=http://s3local-localstack:4566 s3 presign s3://arquivos/${currentBuild.startTimeInMillis}.csv --expires-in 604800
-                            """
+                            echo "Gerando link para download..."
+                            aws --endpoint-url=http://s3local-localstack:4566 s3 presign s3://${UPLOAD_BUCKET_NAME}/${EXPORTED_QUERY_FILES[i]} --expires-in 604800
+                        """
                         }
                     }
                 }
@@ -78,40 +173,42 @@ pipeline {
     }
 }
 
-@NonCPS
-ArrayList getChangedFilesList() {
-    changedFiles = []
-    for (changeLogSet in currentBuild.changeSets) {
-        for (entry in changeLogSet.getItems()) { // for each commit in the detected changes
-            for (file in entry.getAffectedFiles()) {
-                changedFiles.add(file.getPath()) // add changed file to list
-            }
-        }
+String createMainDatabaseUrl(String namespace, String password) {
+    String username = ""
+    String dbName = ""
+    String hostname = ""
+    if (namespace == "staging") {
+        username = "empresas_staging"
+        dbName = "empresas_staging"
+        hostname = "projuris-empresas-staging.c2gjix0ezx3k.us-east-1.rds.amazonaws.com"
+    } else if (namespace == "production") {
+        username = "empresas_production"
+        dbName = "empresas_production"
+        hostname = "projuris-empresas-production.c2gjix0ezx3k.us-east-1.rds.amazonaws.com"
+    } else if (namespace == "dev") {
+        username = "postgres"
+        dbName = "padrao"
+        hostname = "postgres"
     }
-    return changedFiles
+    return String.format("postgres://%s:%s@%s/%s", username, password, hostname, dbName)
 }
 
-@NonCPS
-/*
-Verifica se existe arquivos modificados.
-*/
-boolean hasApplicationChanges() {
-    def changeLogSets = currentBuild.changeSets
-    if (changeLogSets.size() == 0) {
-        return true;
+String createControlDatabaseUrl(String namespace, String password) {
+    String username = ""
+    String dbName = ""
+    String hostname = ""
+    if (namespace == "staging") {
+        username = "empresas_jenkins_staging"
+        dbName = "empresas_jenkins_staging"
+        hostname = "projuris-empresas-staging.c2gjix0ezx3k.us-east-1.rds.amazonaws.com"
+    } else if (namespace == "production") {
+        username = "empresas_jenkins_production"
+        dbName = "empresas_jenkins_production"
+        hostname = "projuris-empresas-production.c2gjix0ezx3k.us-east-1.rds.amazonaws.com"
+    } else if (namespace == "dev") {
+        username = "postgres"
+        dbName = "empresas_jenkins"
+        hostname = "postgres"
     }
-    for (int i = 0; i < changeLogSets.size(); i++) {
-        def entries = changeLogSets[i].items
-        for (int j = 0; j < entries.length; j++) {
-            def entry = entries[j]
-            echo "${entry.commitId} by ${entry.author} on ${new Date(entry.timestamp)}: ${entry.msg}"
-            def files = new ArrayList(entry.affectedFiles)
-            for (int k = 0; k < files.size(); k++) {
-                def file = files[k]
-                echo "arquivo ${file.path}"
-                return true;
-            }
-        }
-    }
-    return false;
+    return String.format("postgres://%s:%s@%s/%s", username, password, hostname, dbName)
 }

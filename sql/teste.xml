@@ -1,0 +1,7 @@
+<query>
+    <namespace>staging</namespace>
+    <sql>
+        insert into f_tenant (id_tenant, name, criado_por, sigla)
+        values (nextval('f_tenant_id_tenant_seq'), substring(md5(random()::text), 0, 25), 'teste', substring(md5(random()::text), 0, 25));
+    </sql>
+</query>

@@ -1,0 +1,143 @@
+#!/usr/bin/env groovy
+pipeline {
+    environment {
+        GIT_USER_EMAIL = "jenkins.empresas@projuris.com.br"
+        GIT_USER_NAME = "Jenkins Pipeline"
+        URL_DB_QUERY = "postgres://postgres:postgres@postgres:5432/padrao"
+        URL_DB_CONTROL = "postgres://postgres:postgres@postgres:5432/empresas_jenkins"
+    }
+
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+    }
+
+    agent {
+        kubernetes {
+            defaultContainer 'awslocal'
+            yaml """
+            spec:
+              containers:
+              - name: clientep
+                image: codingpuss/postgres-client
+                command:
+                - cat
+                tty: true
+              - name: awslocal
+                image: local/sql-name:latest
+                imagePullPolicy: Never
+                command:
+                - cat
+                tty: true
+            """
+        }
+    }
+
+    stages {
+        stage('Checkout Queries') {
+            steps {
+                sh """
+                    apk add git
+                    git config --global user.email '${GIT_USER_EMAIL}'
+                    git config --global user.name '${GIT_USER_NAME}'
+                    git config --global --add safe.directory '*'
+                """
+                script {
+                    checkout scm
+                    def hashCommit = sh(returnStdout: true, script: "git log -1 --pretty=format:\"%h\" | cat").trim()
+                    QUERY_LOG_FILES = sh(returnStdout: true, script: "git diff-tree --no-commit-id --name-only -r ${hashCommit} | grep -E 'query/.*\\.sql'").trim()
+                    COMMAND_LOG_FILES = sh(returnStdout: true, script: "git diff-tree --no-commit-id --name-only -r ${hashCommit} | grep -E 'command/.*\\.sql'").trim()
+                    echo "Query Files: ${QUERY_LOG_FILES}"
+                    echo "Command Files: ${COMMAND_LOG_FILES}"
+                }
+            }
+        }
+        stage('Execute SELECT Queries') {
+            steps {
+                container('clientep') {
+                    script {
+                        EXPORTED_QUERY_FILES = []
+                        sh "mkdir -p output"
+                        QUERY_FILES = QUERY_LOG_FILES.split('\n')
+                        for (int i = 0; i < QUERY_FILES.size(); i++) {
+                            def rawQuery = QUERY_FILES[i];
+
+                            def executed = sh(returnStdout: true, script: "psql -qtA ${URL_DB_CONTROL} -c \"select true from execution_control where execution_file = '${rawQuery}'\"").trim()
+                            if (executed != "") {
+                                echo "Script ${rawQuery} já executado anteriormente. Pulando execução do mesmo."
+                                continue
+                            }
+
+                            def exportedFileName = "${currentBuild.startTimeInMillis}_${i}.csv"
+                            def query = sh(returnStdout: true, script: "tr -d '\\n;' < ${rawQuery}").trim()
+                            echo query
+
+                            sh "psql ${URL_DB_QUERY} pager=off -c \"COPY (${query}) TO STDOUT WITH CSV HEADER;\" > output/${exportedFileName}"
+                            sh "psql ${URL_DB_CONTROL} -c \"insert into execution_control (execution_file) values ('${rawQuery}')\";"
+
+                            EXPORTED_QUERY_FILES << exportedFileName
+                        }
+                    }
+                }
+            }
+        }
+        stage('Execute Command Queries') {
+            steps {
+                container('clientep') {
+                    script {
+                        sh "mkdir -p output"
+                        COMMAND_FILES = COMMAND_LOG_FILES.split('\n')
+                        for (int i = 0; i < COMMAND_FILES.size(); i++) {
+                            def rawQuery = COMMAND_FILES[i];
+
+                            def executed = sh(returnStdout: true, script: "psql -qtA ${URL_DB_CONTROL} -c \"select true from execution_control where execution_file = '${rawQuery}'\"").trim()
+                            if (executed != "") {
+                                echo "Script ${rawQuery} já executado anteriormente. Pulando execução do mesmo."
+                                continue
+                            }
+
+                            def query = sh(returnStdout: true, script: "tr -d '\\n;' < ${rawQuery}").trim()
+                            echo query
+
+                            sh "psql ${URL_DB_QUERY} -c \"${query}\""
+                            sh "psql ${URL_DB_CONTROL} -c \"insert into execution_control (execution_file) values ('${rawQuery}')\";"
+                        }
+                    }
+                }
+            }
+        }
+        stage('Upload de Arquivos no S3') {
+            when {
+                expression {
+
+                    if(EXPORTED_QUERY_FILES.size() == 0){
+                        echo "Nenhuma consulta feita, logo, essa etapa não foi executada."
+                        return false
+                    }
+                    return true
+                }
+            }
+            steps {
+                container('awslocal') {
+                    script {
+                        sh """
+                            aws configure set aws_access_key_id fakeAccessKeyId
+                            aws configure set aws_secret_access_key fakeSecretAccessKey
+                        """
+                        for (int i = 0; i < EXPORTED_QUERY_FILES.size(); i++) {
+                            sh """
+                            cd output
+                            ls
+                            echo "Fazendo upload do arquivo gerado para o S3..."
+                            aws --endpoint-url=http://s3local-localstack:4566 s3api put-object --bucket arquivos --key ${EXPORTED_QUERY_FILES} --body ${EXPORTED_QUERY_FILES}
+
+                            echo "Gerando link para download..."
+                            aws --endpoint-url=http://s3local-localstack:4566 s3 presign s3://arquivos/${EXPORTED_QUERY_FILES} --expires-in 604800
+                        """
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
